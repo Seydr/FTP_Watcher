@@ -1,308 +1,681 @@
+# -*- coding: utf-8 -*-
+# =============================================================================
+# FTP Watcher
+# Surveille un repertoire distant SFTP, telecharge les nouveaux fichiers,
+# les imprime (optionnel) et les archive localement.
+#
+# Ce script est concu pour fonctionner comme un service Windows (via NSSM).
+# Il gere le verrou mono-instance, la stabilite des fichiers, la reprise
+# sur erreur, la reconnexion SFTP et le suivi des fichiers deja traites.
+#
+# Configuration : voir config.example.json
+# =============================================================================
+
 import paramiko
 import logging
 import time
 import os
+import sys
 import json
+import signal
+import posixpath
 import shutil
 import subprocess
-from typing import Optional
 from logging.handlers import TimedRotatingFileHandler
-from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 
 
-# Fonction pour obtenir le répertoire du script
-def obtenir_repertoire_script():
-    return os.path.dirname(os.path.abspath(__file__))
+# =============================================================================
+#  GESTION DU SIGNAL D ARRET
+# =============================================================================
 
-# Charger les paramètres depuis le fichier JSON avec un chemin relatif
-def charger_config(config_file="config.json"):
-    # Chemin absolu relatif au répertoire du script
-    script_dir = obtenir_repertoire_script()
-    config_path = os.path.join(script_dir, config_file)
-    
-    with open(config_path, "r") as f:
-        config = json.load(f)
-    return config
-
-# Fonction d'impression via PDFtoPrinter.exe avec chemin relatif
-def imprimer_pdf_pdf2printer(printer_name: str, pdf_file_path: str) -> None:
-    try:
-        if not os.path.exists(pdf_file_path):
-            logging.error(f"Le fichier PDF n'existe pas: {pdf_file_path}")
-            return
-
-        # Obtenir le chemin de PDFtoPrinter.exe de manière relative
-        script_dir = obtenir_repertoire_script()
-        pdf_to_printer_path = os.path.join(script_dir, "PDFtoPrinter", "PDFtoPrinter.exe")
-        
-        # Vérifier que le fichier PDFtoPrinter.exe existe
-        if not os.path.exists(pdf_to_printer_path):
-            logging.error(f"Le fichier PDFtoPrinter.exe n'existe pas à l'emplacement {pdf_to_printer_path}")
-            return
-        
-        command = [pdf_to_printer_path, pdf_file_path, printer_name]
-        subprocess.run(command, check=True)
-        logging.info(f"Document {pdf_file_path} imprimé avec succès sur {printer_name}")
-    except Exception as e:
-        logging.error(f"Erreur d'impression avec PDFtoPrinter sur {printer_name}: {e}")
+_arreter = False
 
 
-# Fonction pour vérifier si le fichier est complètement téléchargé
-def est_fichier_complet(sftp: paramiko.SFTPClient, remote_path: str, fichier: str, temps_attente: int, retries: int) -> bool:
-    """
-    Vérifie si un fichier est complet en surveillant la taille du fichier.
-    :param sftp: Client SFTP
-    :param remote_path: Chemin distant du fichier
-    :param fichier: Nom du fichier à vérifier
-    :param temps_attente: Temps d'attente (en secondes) avant de vérifier à nouveau
-    :param retries: Nombre de tentatives avant d'abandonner
-    :return: True si le fichier est complet, False sinon
-    """
-
-    try:
-        chemin_distant = os.path.join(remote_path, fichier)
-        
-        # Récupérer la taille initiale du fichier
-        taille_initiale = sftp.stat(chemin_distant).st_size
-        
-        for _ in range(retries):
-            time.sleep(temps_attente)  # Attente avant de vérifier à nouveau
-            taille_actuelle = sftp.stat(chemin_distant).st_size
-            if taille_initiale == taille_actuelle:
-                logging.info(f"Le fichier {fichier} est complet.")
-                return True
-            else:
-                logging.info(f"La taille du fichier {fichier} a changé. Nouvelle tentative...")
-                taille_initiale = taille_actuelle  # Mise à jour de la taille initiale pour la prochaine vérification
-        
-        logging.warning(f"Le fichier {fichier} semble incomplet après plusieurs vérifications.")
-        return False
-    
-    except Exception as e:
-        logging.error(f"Erreur lors de la vérification du fichier {fichier}: {e}")
-        return False
+def _handler_signal(signum, frame):
+    global _arreter
+    _arreter = True
+    logging.info("Signal arret recu (%s). Arret propre en cours...", signum)
+    logging.debug("Flag _arreter passe a True.")
 
 
+signal.signal(signal.SIGINT, _handler_signal)
+signal.signal(signal.SIGTERM, _handler_signal)
 
 
-# Fonction pour établir une connexion SFTP avec tentative de reconnexion en cas d'échec
-def reconnect_sftp(ssh: paramiko.SSHClient, hostname: str, port: int, username: str, password: str, private_key_path: Optional[str] = None, retries: int = 3) -> Optional[paramiko.SFTPClient]:
-    for attempt in range(retries):
-        try:
-            
-            # Charger les clés d'hôtes connues depuis known_hosts
-            ssh.load_host_keys(config["known_hosts_file"])
+# =============================================================================
+#  CHARGEMENT ET VALIDATION DE LA CONFIGURATION
+# =============================================================================
 
-            # Politique de clé manquante (Rejeter les clés inconnues)
-            ssh.set_missing_host_key_policy(paramiko.RejectPolicy())
-
-            # Connexion avec clé privée ou mot de passe
-            if private_key_path:
-                ssh.connect(hostname, port, username, key_filename=private_key_path)
-                logging.info("Connexion SFTP réussie avec clé privée.")
-            else:
-                ssh.connect(hostname, port, username, password=password)
-                logging.info("Connexion SFTP réussie avec mot de passe.")
-
-            # Ouvrir le canal SFTP
-            return ssh.open_sftp()
-
-        except Exception as e:
-            logging.error(f"Erreur de connexion SFTP (tentative {attempt+1}/{retries}): {e}")
-            if attempt == retries - 1:
-                logging.error("Toutes les tentatives de connexion ont échoué.")
-                return None
-            time.sleep(5)  # Attente avant la nouvelle tentative
+CLES_OBLIGATOIRES = {
+    "hostname": str,
+    "port": int,
+    "username": str,
+    "known_hosts_file": str,
+    "remote_path": str,
+    "local_path": str,
+    "archive_dir": str,
+    "extensions_valides": list,
+    "check_interval": (int, float),
+    "temps_attente": (int, float),
+    "retries": int,
+    "retries_stabilite": int,
+    "log_file": str,
+    "log_level": str,
+    "lock_file": str,
+    "state_file": str,
+    "activer_logs": bool,
+}
 
 
-# Configuration du logger avec rotation et archivage des logs
-def setup_logger(activer_logs: bool, log_file: str, logs_archive_dir: str, log_level: str) -> None:
+def charger_config(config_file):
+    if not os.path.isfile(config_file):
+        raise FileNotFoundError("Fichier de configuration introuvable : %s" % config_file)
+    with open(config_file, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def valider_config(config):
+    erreurs = []
+
+    for cle, type_attendu in CLES_OBLIGATOIRES.items():
+        if cle not in config:
+            erreurs.append("Cle manquante : '%s'" % cle)
+            continue
+        if not isinstance(config[cle], type_attendu):
+            erreurs.append(
+                "Cle '%s' : type attendu %s, recu %s"
+                % (cle, type_attendu, type(config[cle]))
+            )
+
+    if "check_interval" in config and config["check_interval"] <= 0:
+        erreurs.append("'check_interval' doit etre > 0")
+    if "temps_attente" in config and config["temps_attente"] <= 0:
+        erreurs.append("'temps_attente' doit etre > 0")
+    if "retries" in config and config["retries"] < 1:
+        erreurs.append("'retries' doit etre >= 1")
+
+    confirmations = config.get("stability_confirmations", 2)
+    if confirmations < 1:
+        erreurs.append("'stability_confirmations' doit etre >= 1")
+
+    if "retries_stabilite" in config and config["retries_stabilite"] < (confirmations + 1):
+        erreurs.append(
+            "'retries_stabilite' doit etre >= %s (confirmations=%s + 1)"
+            % (confirmations + 1, confirmations)
+        )
+
+    if not config.get("password") and not config.get("private_key_path"):
+        erreurs.append("Aucune authentification : 'password' ou 'private_key_path' requis")
+
+    if config.get("private_key_path") and not os.path.isfile(config["private_key_path"]):
+        erreurs.append("Cle privee introuvable : %s" % config["private_key_path"])
+
+    if config.get("known_hosts_file") and not os.path.isfile(config["known_hosts_file"]):
+        erreurs.append("Fichier known_hosts introuvable : %s" % config["known_hosts_file"])
+
+    if config.get("local_path") and not os.path.isdir(config["local_path"]):
+        erreurs.append("Dossier local introuvable : %s" % config["local_path"])
+
+    if config.get("imprimer_fichier"):
+        if not config.get("printer_name"):
+            erreurs.append("'printer_name' requis si 'imprimer_fichier' est True")
+        if not config.get("pdf_to_printer_path"):
+            erreurs.append("'pdf_to_printer_path' requis si 'imprimer_fichier' est True")
+
+    if erreurs:
+        raise ValueError("Configuration invalide :\n  - " + "\n  - ".join(erreurs))
+
+
+# =============================================================================
+#  LOGGER
+# =============================================================================
+
+def setup_logger(config):
+    log_file = config["log_file"]
     log_dir = os.path.dirname(log_file)
-    if not os.path.exists(log_dir):
-        os.makedirs(log_dir)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
 
-    if activer_logs:
-        handler = TimedRotatingFileHandler(log_file, when="midnight", interval=1, backupCount=7)
-        handler.suffix = "%Y-%m-%d.log"  # Format du suffixe des fichiers de log
+    if config.get("activer_logs", True):
+        handler = TimedRotatingFileHandler(
+            log_file,
+            when="midnight",
+            interval=1,
+            backupCount=config.get("log_backup_count", 30),
+            encoding="utf-8",
+        )
+        handler.suffix = "%Y-%m-%d.log"
 
-        # Convertir le niveau de log en fonction du paramètre `log_level`
-        log_level_dict = {
+        niveaux = {
             "DEBUG": logging.DEBUG,
             "INFO": logging.INFO,
             "WARNING": logging.WARNING,
             "ERROR": logging.ERROR,
-            "CRITICAL": logging.CRITICAL
+            "CRITICAL": logging.CRITICAL,
         }
-        level = log_level_dict.get(log_level.upper(), logging.INFO)   # Par défaut INFO si non spécifié
+        level = niveaux.get(config["log_level"].upper(), logging.INFO)
 
         logging.basicConfig(
-            level=level,  # Niveau de log dynamique en fonction de la configuration
+            level=level,
             handlers=[handler],
-            format='%(asctime)s - %(levelname)s - %(message)s'  # Ajoute l'heure dans le format des logs
+            format="%(asctime)s - %(levelname)s - %(message)s",
         )
-        logging.info("Démarrage du script.")
+        logging.info("======================================================================")
+        logging.info("Demarrage de FTP Watcher")
+        logging.info("PID             : %s", os.getpid())
+        logging.info("Paramiko        : %s", getattr(paramiko, "__version__", "unknown"))
+        logging.info("Serveur SFTP    : %s:%s", config["hostname"], config["port"])
+        logging.info("Surveillance de : %s", config["remote_path"])
+        logging.info("Telechargement  : %s", config["local_path"])
+        logging.info("Archives        : %s", config["archive_dir"])
+        logging.info("Extensions      : %s", config["extensions_valides"])
+        logging.info("======================================================================")
+        logging.debug("Niveau de log actif : %s", config["log_level"].upper())
+        logging.debug("Intervalle de scan : %s s", config["check_interval"])
+        logging.debug("Retries connexion SFTP : %s", config["retries"])
+        logging.debug("Retries stabilite fichier : %s", config["retries_stabilite"])
+        logging.debug("Confirmations stabilite : %s", config.get("stability_confirmations", 2))
+        logging.debug("Temps attente stabilite : %s s", config["temps_attente"])
+        logging.debug("Impression : %s", config.get("imprimer_fichier", False))
+        logging.debug("Archivage : %s", config.get("archiver_fichier", True))
     else:
-        logging.disable(logging.CRITICAL)  # Désactive tous les logs si activer_logs est False
+        logging.disable(logging.CRITICAL)
 
 
-# Fonction pour archiver les logs dans un répertoire d'archive
-def archiver_logs(log_file: str, archive_dir: str) -> None:
-    log_dir = os.path.dirname(log_file)  # Répertoire contenant le fichier log actuel
-    
-    # Vérifier si le répertoire d'archive existe, sinon le créer
-    if not os.path.exists(archive_dir):
-        os.makedirs(archive_dir)
+# =============================================================================
+#  VERROU MONO-INSTANCE
+# =============================================================================
+
+def verifier_instance_unique(lock_file):
+    lock_dir = os.path.dirname(lock_file)
+    if lock_dir:
+        os.makedirs(lock_dir, exist_ok=True)
 
     try:
-        # Déplacer les fichiers log (y compris les fichiers avec suffixe de date) vers l'archive
-        for fichier_log in os.listdir(log_dir):
-            # Filtrer les fichiers .log, y compris ceux avec suffixe de date
-            if fichier_log.endswith(".log") and fichier_log != os.path.basename(log_file):
-                archive_path = os.path.join(archive_dir, fichier_log)
-                shutil.move(os.path.join(log_dir, fichier_log), archive_path)
-                logging.info(f"Log déplacé dans l'archive : {archive_path}")
+        f = open(lock_file, "w")
+        if sys.platform == "win32":
+            import msvcrt
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        f.write("PID=%s - Demarre le %s\n" % (os.getpid(), datetime.now()))
+        f.flush()
+        return f
+    except (IOError, OSError) as e:
+        print("ERREUR : une autre instance tourne deja (%s). Arret." % e)
+        sys.exit(1)
+
+
+# =============================================================================
+#  ETAT PERSISTANT (fichiers deja traites)
+# =============================================================================
+
+def charger_state(state_file):
+    if not os.path.isfile(state_file):
+        return {}
+    try:
+        with open(state_file, "r", encoding="utf-8") as f:
+            return json.load(f)
     except Exception as e:
-        logging.error(f"Erreur lors de l'archivage des logs : {e}")
+        logging.error("Impossible de charger le state %s : %s", state_file, e)
+        return {}
 
 
-
-# Fonction pour télécharger et supprimer un fichier
-def telecharger_et_supprimer_fichier(sftp: paramiko.SFTPClient, remote_path: str, local_path: str, fichier: str, deplacer_fichier: bool) -> None:
+def sauver_state(state_file, state):
     try:
-        chemin_distant = os.path.join(remote_path, fichier)
-        chemin_local = os.path.join(local_path, fichier)
-
-        if deplacer_fichier:
-            logging.info(f"Téléchargement de {chemin_distant} vers {chemin_local}")
-            sftp.get(chemin_distant, chemin_local)
-            logging.info(f"Fichier téléchargé : {chemin_distant}")
-            
-            # Suppression du fichier sur le serveur
-            sftp.remove(chemin_distant)
-            logging.info(f"Fichier supprimé du serveur : {chemin_distant}")
+        with open(state_file, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
     except Exception as e:
-        logging.error(f"Erreur lors du téléchargement ou de la suppression du fichier {fichier}: {e}")
+        logging.error("Impossible de sauver le state %s : %s", state_file, e)
 
 
-# Fonction pour traiter un fichier (téléchargement, impression, archivage)
-def traiter_fichier(fichier: str, sftp: paramiko.SFTPClient, remote_path: str, local_path: str, printer_name: str, archive_dir: str, deplacer_fichier: bool, archiver_fichier: bool, imprimer_fichier: bool) -> None:
+def purger_state(state, retention_jours=30):
+    seuil = time.time() - (retention_jours * 86400)
+    a_supprimer = [k for k, v in state.items() if v < seuil]
+    for k in a_supprimer:
+        del state[k]
+    if a_supprimer:
+        logging.debug("State purge : %s entree(s) ancienne(s).", len(a_supprimer))
+
+
+# =============================================================================
+#  CONNEXION SFTP
+# =============================================================================
+
+def connecter_sftp(config):
+    logging.debug(
+        "Sequence de connexion SFTP vers %s:%s (max %s tentatives).",
+        config["hostname"], config["port"], config["retries"]
+    )
+
+    for tentative in range(config["retries"]):
+        logging.debug("Tentative SFTP %s/%s...", tentative + 1, config["retries"])
+        try:
+            ssh = paramiko.SSHClient()
+            ssh.load_host_keys(config["known_hosts_file"])
+            ssh.set_missing_host_key_policy(paramiko.RejectPolicy())
+
+            if config.get("private_key_path"):
+                logging.debug("Auth par cle privee : %s", config["private_key_path"])
+                ssh.connect(
+                    config["hostname"],
+                    config["port"],
+                    config["username"],
+                    key_filename=config["private_key_path"],
+                    timeout=30,
+                )
+            else:
+                logging.debug("Auth par mot de passe (user=%s)", config["username"])
+                ssh.connect(
+                    config["hostname"],
+                    config["port"],
+                    config["username"],
+                    password=config["password"],
+                    timeout=30,
+                )
+
+            transport = ssh.get_transport()
+            if transport is not None:
+                transport.set_keepalive(30)
+                logging.debug("Keepalive SSH active (30 s).")
+
+            sftp = ssh.open_sftp()
+            logging.info("Connexion SFTP reussie.")
+            return ssh, sftp
+
+        except Exception as e:
+            logging.error(
+                "Erreur connexion SFTP (tentative %s/%s) : %s",
+                tentative + 1,
+                config["retries"],
+                e,
+            )
+            if tentative < config["retries"] - 1:
+                time.sleep(5)
+            else:
+                logging.error("Echec de toutes les tentatives de connexion.")
+                return None, None
+
+
+def connexion_sftp_active(ssh, sftp):
     try:
-        chemin_distant = os.path.join(remote_path, fichier)
-        chemin_local = os.path.join(local_path, fichier)
+        if ssh is None or sftp is None:
+            return False
 
-        # Vérification si le fichier est complet avant de le télécharger
-        if not est_fichier_complet(sftp, remote_path, fichier,config["temps_attente"],config["retries"]):
-            logging.error(f"Le fichier {fichier} n'est pas complet, saut du téléchargement.")
-            return
+        transport = ssh.get_transport()
+        if transport is None or not transport.is_active():
+            return False
+
+        canal = sftp.get_channel()
+        if canal is None or canal.closed:
+            return False
+
+        return True
+    except Exception:
+        return False
 
 
-        # Vérification de l'existence du répertoire local
-        if deplacer_fichier and not os.path.exists(os.path.dirname(chemin_local)):
-            os.makedirs(os.path.dirname(chemin_local), exist_ok=True)
+# =============================================================================
+#  VERIFICATION DE STABILITE D UN FICHIER DISTANT
+# =============================================================================
 
-        # Télécharger le fichier
-        if deplacer_fichier:
-            telecharger_et_supprimer_fichier(sftp, remote_path, local_path, fichier, deplacer_fichier)
+def attendre_fichier_stable(sftp, chemin_distant, temps_attente, retries, confirmations=2):
+    precedent = None
+    nb_ok = 0
 
-        
-        # Temporisation avant d'ouvrir le fichier
-        time.sleep(config["sleep_before_print"])
+    for i in range(retries):
+        try:
+            st = sftp.stat(chemin_distant)
+            courant = (st.st_size, int(st.st_mtime))
+        except OSError as e:
+            logging.debug("Stabilite %s : stat impossible (%s)", chemin_distant, e)
+            return False
 
-        # Tentative d'impression via PDFtoPrinter
-        if imprimer_fichier:
-            imprimer_pdf_pdf2printer(printer_name, chemin_local)
+        logging.debug(
+            "Stabilite %s : check %s/%s -> (size=%s, mtime=%s)",
+            chemin_distant, i + 1, retries, courant[0], courant[1]
+        )
 
-        # Temporisation avant de déplacer le fichier dans les archives
-        if archiver_fichier:
-            time.sleep(config["sleep_before_move"])
-            shutil.move(chemin_local, os.path.join(archive_dir, fichier))
-            logging.info(f"Fichier archivé : {chemin_local}")
+        if courant == precedent:
+            nb_ok += 1
+            logging.debug("Stabilite %s : confirmation %s/%s", chemin_distant, nb_ok, confirmations)
+            if nb_ok >= confirmations:
+                logging.debug("Stabilite %s : fichier STABLE.", chemin_distant)
+                return True
+        else:
+            nb_ok = 0
+            precedent = courant
 
+        time.sleep(temps_attente)
+
+    logging.warning(
+        "Fichier %s : taille/mtime instable apres %s verifications.",
+        chemin_distant, retries,
+    )
+    return False
+
+
+# =============================================================================
+#  TELECHARGEMENT
+# =============================================================================
+
+def telecharger_fichier(sftp, chemin_distant, chemin_local):
+    chemin_temp = chemin_local + ".downloading"
+
+    logging.debug("Telechargement : source = %s", chemin_distant)
+    logging.debug("Telechargement : cible = %s", chemin_local)
+
+    t_debut = time.time()
+    sftp.get(chemin_distant, chemin_temp)
+    duree = time.time() - t_debut
+
+    taille = os.path.getsize(chemin_temp)
+    logging.debug(
+        "Telechargement termine en %.3f s (%s octets, %.0f octets/s)",
+        duree, taille, taille / duree if duree > 0 else 0
+    )
+
+    # Renommer le .downloading en nom final (atomique)
+    os.replace(chemin_temp, chemin_local)
+
+
+# =============================================================================
+#  IMPRESSION
+# =============================================================================
+
+def imprimer_fichier(config, chemin_local):
+    if not config.get("imprimer_fichier", False):
+        return True
+
+    pdf_to_printer = config["pdf_to_printer_path"]
+    printer_name = config["printer_name"]
+
+    if not os.path.isfile(pdf_to_printer):
+        logging.error("PDFtoPrinter introuvable : %s", pdf_to_printer)
+        return False
+
+    if not os.path.isfile(chemin_local):
+        logging.error("Fichier a imprimer introuvable : %s", chemin_local)
+        return False
+
+    logging.debug("Impression de %s sur '%s'...", chemin_local, printer_name)
+    try:
+        subprocess.run(
+            [pdf_to_printer, chemin_local, printer_name],
+            check=True,
+            timeout=120,
+        )
+        logging.info("Impression reussie : %s", os.path.basename(chemin_local))
+        return True
+    except subprocess.CalledProcessError as e:
+        logging.error("Erreur PDFtoPrinter (code %s) pour %s", e.returncode, chemin_local)
+        return False
     except Exception as e:
-        logging.error(f"Erreur d'impression ou d'extraction PDF pour {fichier}: {e}")
+        logging.error("Erreur impression %s : %s", chemin_local, e)
+        return False
 
 
-# Fonction pour surveiller les fichiers et traiter les nouveaux fichiers PDF
-def surveiller_et_telecharger(config: dict) -> None:
-    # Configuration du logger
-    setup_logger(config["activer_logs"], config["log_file"], config["logs_archive_dir"], config["log_level"])
-    
-    # Connexion SFTP initiale
-    ssh = paramiko.SSHClient()
-    ssh.load_host_keys(config["known_hosts_file"])
-    sftp = reconnect_sftp(ssh, config["hostname"], config["port"], config["username"], config["password"], config["private_key_path"], config["retries"])
-    if sftp is None:
-        logging.error("Échec de la connexion SFTP.")
-        return
+# =============================================================================
+#  ARCHIVAGE LOCAL
+# =============================================================================
 
+def deplacer_fichier(source, destination):
     try:
-        # Tentative d'accès au répertoire distant
-        logging.debug(f"Tentative d'accès au répertoire SFTP: {config['remote_path']}")
-        fichiers_initiaux = set(sftp.listdir(config["remote_path"]))
-        
-        # Charger les extensions valides depuis config.json
-        extensions_valides = tuple(config["extensions_valides"])  # Chargement des extensions valides à partir du JSON
+        os.replace(source, destination)
+        return True
+    except OSError:
+        try:
+            shutil.move(source, destination)
+            return True
+        except Exception as e:
+            logging.error("Echec deplacement %s -> %s : %s", source, destination, e)
+            return False
 
 
-        # Filtrage des fichiers PDF
-        fichiers_pdf_initiaux = {fichier for fichier in fichiers_initiaux if fichier.lower().endswith(extensions_valides)}
-        logging.debug(f"Fichiers PDF initiaux dans {config['remote_path']}: {fichiers_pdf_initiaux}")
+def archiver_fichier(config, chemin_local, nom_fichier):
+    if not config.get("archiver_fichier", True):
+        return True
 
-        
+    archive_dir = config["archive_dir"]
+    os.makedirs(archive_dir, exist_ok=True)
 
-        while True:
-            # Vérification de la connexion SFTP avant chaque interaction
-            if sftp.sock is None or sftp.sock.getpeername() is None:
-                logging.warning("Connexion SFTP perdue, tentative de reconnexion...")
-                
-                # Tentatives de reconnexion avec un intervalle de 30 secondes
-                reconnection_retries = 5  # Nombre de tentatives de reconnexion
-                for attempt in range(reconnection_retries):
-                    logging.info(f"Tentative de reconnexion SFTP {attempt + 1}/{reconnection_retries}...")
-                    sftp = reconnect_sftp(ssh, config["hostname"], config["port"], config["username"], config["password"], config["private_key_path"], config["retries"])
-                    
-                    if sftp:
-                        logging.info("Reconnexion SFTP réussie.")
-                        break
-                    else:
-                        logging.error(f"Échec de la reconnexion SFTP (tentative {attempt + 1}/{reconnection_retries}).")
-                        time.sleep(30)  # Attente de 30 secondes avant la prochaine tentative
-                
-                # Si la reconnexion échoue après toutes les tentatives, on quitte la boucle
-                if not sftp:
-                    logging.error("Échec de la reconnexion SFTP après plusieurs tentatives.")
-                    break
+    base, ext = os.path.splitext(nom_fichier)
+    chemin_archive = os.path.join(archive_dir, nom_fichier)
+    if os.path.exists(chemin_archive):
+        suffixe = datetime.now().strftime("%Y%m%d_%H%M%S")
+        chemin_archive = os.path.join(archive_dir, "%s_%s%s" % (base, suffixe, ext))
 
+    if deplacer_fichier(chemin_local, chemin_archive):
+        logging.info("Fichier archive : %s", os.path.basename(chemin_archive))
+        return True
+    return False
+
+
+# =============================================================================
+#  TRAITEMENT D UN FICHIER
+# =============================================================================
+
+def traiter_fichier(config, sftp, nom_fichier, state):
+    chemin_distant = posixpath.join(config["remote_path"], nom_fichier)
+    chemin_local = os.path.join(config["local_path"], nom_fichier)
+    confirmations = config.get("stability_confirmations", 2)
+
+    logging.info("Traitement de : %s", nom_fichier)
+    t_debut = time.time()
+
+    # 1. Stabilite du fichier distant
+    if not attendre_fichier_stable(
+        sftp, chemin_distant,
+        config["temps_attente"],
+        config["retries_stabilite"],
+        confirmations,
+    ):
+        logging.warning("Fichier %s non stable, report.", nom_fichier)
+        return False
+
+    # 2. Telechargement
+    try:
+        telecharger_fichier(sftp, chemin_distant, chemin_local)
+        logging.info("Fichier telecharge : %s", nom_fichier)
+    except Exception as e:
+        logging.error("Echec telechargement %s : %s", nom_fichier, e)
+        # Nettoyage du .downloading eventuel
+        chemin_temp = chemin_local + ".downloading"
+        if os.path.exists(chemin_temp):
             try:
-                fichiers_actuels = set(sftp.listdir(config["remote_path"]))
-                fichiers_pdf_actuels = {fichier for fichier in fichiers_actuels if fichier.lower().endswith(extensions_valides)}
-                nouveaux_fichiers_pdf = fichiers_pdf_actuels - fichiers_pdf_initiaux
-                
-                if nouveaux_fichiers_pdf:
-                    logging.info(f"Nouveaux fichiers PDF trouvés: {nouveaux_fichiers_pdf}")
-                    
-                    with ThreadPoolExecutor(max_workers=config["max_workers"]) as executor:
-                        for fichier in nouveaux_fichiers_pdf:
-                            executor.submit(traiter_fichier, fichier, sftp, config["remote_path"], config["local_path"], config["printer_name"], config["archive_dir"], config["deplacer_fichier"], config["archiver_fichier"], config["imprimer_fichier"])
-                
-                fichiers_pdf_initiaux = fichiers_pdf_actuels
-                archiver_logs(config["log_file"], config["logs_archive_dir"])
+                os.remove(chemin_temp)
+            except OSError:
+                pass
+        return False
+
+    # 3. Impression (optionnelle)
+    time.sleep(config.get("sleep_before_print", 0))
+    if not imprimer_fichier(config, chemin_local):
+        logging.error("Impression echouee pour %s", nom_fichier)
+        # On ne supprime PAS le fichier distant -> retry
+        return False
+
+    # 4. Archivage (optionnel)
+    time.sleep(config.get("sleep_before_move", 0))
+    if not archiver_fichier(config, chemin_local, nom_fichier):
+        logging.error("Archivage echoue pour %s", nom_fichier)
+        return False
+
+    # 5. Suppression du fichier distant (uniquement si tout est OK)
+    if config.get("supprimer_apres_traitement", True):
+        try:
+            sftp.remove(chemin_distant)
+            logging.info("Fichier distant supprime : %s", nom_fichier)
+        except Exception as e:
+            logging.error("Echec suppression distante %s : %s", nom_fichier, e)
+            return False
+
+    # 6. Marquer comme traite
+    state[nom_fichier] = time.time()
+
+    duree = time.time() - t_debut
+    logging.debug("Fichier %s traite en %.3f s.", nom_fichier, duree)
+    return True
+
+
+# =============================================================================
+#  BOUCLE DE SURVEILLANCE
+# =============================================================================
+
+def surveiller(config):
+    _lock_handle = None
+    ssh = None
+    sftp = None
+
+    try:
+        _lock_handle = verifier_instance_unique(config["lock_file"])
+        setup_logger(config)
+
+        # Verifier / creer les dossiers locaux
+        os.makedirs(config["local_path"], exist_ok=True)
+        os.makedirs(config["archive_dir"], exist_ok=True)
+
+        # Charger l'etat
+        state = charger_state(config["state_file"])
+        purger_state(state, config.get("state_retention_days", 30))
+        logging.debug("State charge : %s entree(s).", len(state))
+
+        # Connexion SFTP
+        logging.debug("Connexion SFTP initiale...")
+        ssh, sftp = connecter_sftp(config)
+        if sftp is None:
+            logging.critical("Impossible de se connecter au SFTP. Arret.")
+            sys.exit(1)
+
+        extensions_valides = tuple(e.lower() for e in config["extensions_valides"])
+        logging.debug("Extensions filtrees : %s", extensions_valides)
+
+        numero_cycle = 0
+        purge_state_tous_les_n = config.get("purge_state_every_n_cycles", 10000)
+
+        while not _arreter:
+            numero_cycle += 1
+            logging.debug("--- Debut cycle #%s ---", numero_cycle)
+
+            # Verification de la connexion
+            if not connexion_sftp_active(ssh, sftp):
+                logging.warning("Connexion SFTP perdue. Reconnexion...")
+                try:
+                    if sftp is not None:
+                        sftp.close()
+                except Exception:
+                    pass
+                try:
+                    if ssh is not None:
+                        ssh.close()
+                except Exception:
+                    pass
+
+                ssh, sftp = connecter_sftp(config)
+                if sftp is None:
+                    logging.critical("Reconnexion SFTP impossible. Arret en erreur.")
+                    raise RuntimeError("Reconnexion SFTP impossible")
+            else:
+                logging.debug("Verification connexion SFTP : OK")
+
+            # Lister les fichiers distants
+            try:
+                tous_fichiers = sftp.listdir(config["remote_path"])
+                logging.debug("Dossier distant scanne : %s entrees.", len(tous_fichiers))
+
+                fichiers = []
+                for f in tous_fichiers:
+                    if not f.lower().endswith(extensions_valides):
+                        continue
+                    if f in state:
+                        logging.debug("Fichier deja traite (state) : %s", f)
+                        continue
+                    fichiers.append(f)
+                    logging.debug("Fichier retenu : %s", f)
             except Exception as e:
-                logging.error(f"Erreur lors de la surveillance des fichiers: {e}")
-            
-            # Intervalle de vérification
+                logging.error("Erreur lecture dossier distant %s : %s", config["remote_path"], e)
+                time.sleep(config["check_interval"])
+                continue
+
+            # Tri par nom pour traitement stable
+            fichiers.sort()
+
+            # Traitement sequentiel
+            if fichiers:
+                logging.info("%s fichier(s) a traiter : %s", len(fichiers), fichiers)
+                for nom_fichier in fichiers:
+                    if _arreter:
+                        logging.debug("Arret demande, on stoppe.")
+                        break
+                    try:
+                        traiter_fichier(config, sftp, nom_fichier, state)
+                    except Exception as e:
+                        logging.error(
+                            "Erreur traitement %s : %s",
+                            nom_fichier, e, exc_info=True,
+                        )
+                # Sauver le state apres chaque batch
+                sauver_state(config["state_file"], state)
+            else:
+                logging.debug("Aucun fichier a traiter dans ce cycle.")
+
+            # Purge periodique du state
+            if purge_state_tous_les_n > 0 and numero_cycle % purge_state_tous_les_n == 0:
+                logging.debug("Purge periodique du state...")
+                purger_state(state, config.get("state_retention_days", 30))
+                sauver_state(config["state_file"], state)
+
+            logging.debug("--- Fin cycle #%s ---", numero_cycle)
             time.sleep(config["check_interval"])
-    
+
     finally:
-        logging.info("Fermeture de la connexion SFTP.")
-        sftp.close()
-        ssh.close()
+        logging.info("Arret du service...")
+        try:
+            if sftp is not None:
+                sftp.close()
+        except Exception:
+            pass
+        try:
+            if ssh is not None:
+                ssh.close()
+        except Exception:
+            pass
+        try:
+            if _lock_handle is not None:
+                _lock_handle.close()
+        except Exception:
+            pass
+        logging.info("Service arrete proprement.")
 
 
+# =============================================================================
+#  POINT D ENTREE
+# =============================================================================
 
 if __name__ == "__main__":
-    # Charger la configuration en utilisant un chemin relatif
-    config = charger_config("config.json")
-    
-    # Appeler la fonction principale pour surveiller et traiter les fichiers
-    surveiller_et_telecharger(config)
+    if len(sys.argv) > 1:
+        config_path = sys.argv[1]
+    else:
+        config_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "config.json"
+        )
+
+    try:
+        config = charger_config(config_path)
+    except Exception as e:
+        print("ERREUR : chargement de la config impossible : %s" % e)
+        sys.exit(1)
+
+    try:
+        valider_config(config)
+    except ValueError as e:
+        print("ERREUR : %s" % e)
+        sys.exit(1)
+
+    try:
+        surveiller(config)
+    except Exception as e:
+        try:
+            logging.critical("Erreur fatale : %s", e, exc_info=True)
+        except Exception:
+            print("ERREUR FATALE : %s" % e)
+        sys.exit(1)

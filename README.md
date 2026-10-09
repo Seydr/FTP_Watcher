@@ -1,78 +1,233 @@
-# SFTP_Watcher
+# FTP Watcher
 
-# Import des modules
-pip install paramiko logging subprocess shutil concurrent  
+> Service Python qui surveille un répertoire distant SFTP et télécharge automatiquement les fichiers, avec impression et archivage local optionnels.
 
-## Description du Script
-Ce script a pour objectif de surveiller un répertoire distant via SFTP, de télécharger, d'imprimer et d'archiver des fichiers PDF automatiquement. Il fonctionne en mode continu, en vérifiant régulièrement l'existence de nouveaux fichiers PDF dans le répertoire distant spécifié. Lorsqu'un nouveau fichier PDF est détecté, il est traité selon une série d'actions configurables, incluant son téléchargement, son impression et son archivage local.  
-Le script utilise des threads pour gérer plusieurs fichiers simultanément, permettant ainsi d'optimiser les performances lors du traitement de plusieurs fichiers.  
-# Fonctionnalités principales  
-## Surveillance SFTP :
-Le script se connecte à un serveur SFTP en utilisant des informations d'identification telles qu'un mot de passe ou une clé privée. Il vérifie en permanence le répertoire distant à la recherche de nouveaux fichiers PDF.  
-La connexion SFTP peut être rétablie en cas de déconnexion, et plusieurs tentatives sont effectuées pour garantir une connexion fiable.  
-## Vérification de la complétude des fichiers :  
-Avant de télécharger un fichier, le script vérifie que le fichier est complet en surveillant sa taille. Si la taille du fichier reste inchangée sur plusieurs cycles de vérification, il est considéré comme complet et prêt à être téléchargé.  
-## Téléchargement et suppression de fichiers :
-Une fois le fichier PDF complet, il est téléchargé depuis le serveur SFTP vers un répertoire local. Après cela, le fichier est supprimé du serveur distant pour éviter les doublons.  
-## Impression des fichiers PDF :  
-Après le téléchargement, le fichier PDF peut être envoyé à une imprimante configurée via l'outil PDFtoPrinter.exe, qui permet d'imprimer des fichiers PDF sans ouvrir une application dédiée. La temporisation avant l'impression peut être configurée dans le fichier de configuration.  
-## Archivage des fichiers :
-Le fichier PDF téléchargé peut être déplacé dans un répertoire d'archive après avoir été imprimé. La temporisation avant le déplacement peut également être configurée pour garantir que le processus d'impression est terminé avant de déplacer le fichier.  
-## Archivage des logs :
-Les logs du script sont archivés chaque jour à l'aide d'un mécanisme de rotation de fichiers. Les logs anciens peuvent être déplacés vers un répertoire d'archive pour conserver l'historique des exécutions du script.  
-Exécution en mode multithread :  
-Le script utilise un ThreadPoolExecutor pour traiter plusieurs fichiers simultanément, ce qui améliore la performance lors du traitement de nombreux fichiers. Cela permet d'exécuter des tâches telles que l'impression et l'archivage sans bloquer le traitement des autres fichiers.  
-## Reconnexion Automatique SFTP :
-En cas de perte de la connexion SFTP, le script tente automatiquement de se reconnecter pendant un nombre défini de tentatives. (5 fois tout les 30 secondes)  
-  
-# Configuration
-Le script est configuré à l'aide d'un fichier config.json qui contient tous les paramètres nécessaires à son exécution. Les principaux paramètres configurables sont :  
-## Connexion SFTP :
-hostname : Adresse du serveur SFTP.  
-port : Port utilisé pour la connexion (par défaut 22).  
-username : Nom d'utilisateur pour la connexion.  
-password : Mot de passe pour la connexion (ou private_key_path pour utiliser une clé privée).  
-private_key_path : Chemin vers le fichier de clé privée (optionnel si un mot de passe est utilisé).  
-remote_path : Chemin du répertoire à surveiller sur le serveur SFTP.  
-local_path : Répertoire local où les fichiers seront téléchargés.  
-## Impression et archivage :
-printer_name : Nom de l'imprimante pour l'impression des fichiers PDF.  
-archive_dir : Répertoire d'archive pour déplacer les fichiers après leur traitement.  
-deplacer_fichier : Si True, les fichiers seront supprimés du serveur après téléchargement.  
-archiver_fichier : Si True, les fichiers seront archivés après traitement.  
-imprimer_fichier : Si True, les fichiers seront imprimés avant l'archivage.  
-## Temporisation :
-sleep_before_print : Temps d'attente (en secondes) avant de lancer l'impression d'un fichier.  
-sleep_before_move : Temps d'attente (en secondes) avant de déplacer un fichier vers le répertoire d'archive.  
-## Logs :
-activer_logs : Si True, l'enregistrement des logs est activé.  
-log_file : Chemin du fichier de log.  
-logs_archive_dir : Répertoire où les logs seront archivés.  
-log_level : Niveau de détail des logs (par exemple, INFO, DEBUG, ERROR).  
-## Autres :
-max_workers : Nombre maximum de threads pour traiter les fichiers en parallèle.  
-check_interval : Intervalle (en secondes) entre chaque vérification des nouveaux fichiers sur le serveur.  
-  
-# Fonctionnement
-Le script se lance et charge la configuration à partir du fichier config.json.  
-Il établit une connexion SFTP avec les informations d'identification fournies.  
-Le répertoire distant est surveillé à la recherche de nouveaux fichiers PDF. 
-Lorsqu'un fichier est trouvé, il est vérifié pour s'assurer qu'il est complet.  
-Le fichier est téléchargé, imprimé (si configuré) et archivé (si configuré).  
-Les logs de l'exécution du script sont enregistrés et archivés de manière régulière.  
-  
-# Conclusion
-Ce script permet d'automatiser le processus de surveillance, de téléchargement, d'impression et d'archivage des fichiers PDF via une connexion SFTP. Grâce à sa configuration flexible et son fonctionnement en mode multithread, il est parfaitement adapté pour gérer un grand nombre de fichiers PDF de manière efficace et sans intervention manuelle.  
-  
-## Configuration de l'impression
-Utilisation de PDFtoPrinter pour imprimer
-.\PDFtoPrinter\PDFtoPrinter.exe
+[![Python](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org/)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-Windows-lightgrey)]()
 
-## Générer la clé SSH pour se connecter 
+## Sommaire
 
-ssh-keygen  <-- Pour creer les dossier  
-ssh-keyscan -t ecdsa sftpserveur.com >>  ~/.ssh/known_hosts  
+- [Fonctionnalités](#fonctionnalités)
+- [Architecture](#architecture)
+- [Installation](#installation)
+- [Configuration](#configuration)
+- [Déploiement en service Windows](#déploiement-en-service-windows)
+- [Comportement en cas d'erreur](#comportement-en-cas-derreur)
+- [Dépannage](#dépannage)
+- [Licence](#licence)
 
-Se rendre dans C:\Users\usename\.ssh\  
-Ouvrir le fichier "known_hosts" et changer l'encodage de UTF6 à UTF8. Enregistrer  
-Le déplacer dans : .\sFTP_Watcher\  
+## Fonctionnalités
+
+- **Surveillance continue** d'un répertoire distant SFTP
+- **Téléchargement automatique** des nouveaux fichiers
+- **Impression optionnelle** via PDFtoPrinter
+- **Archivage local** des fichiers traités
+- **Suppression distante** après traitement réussi
+- **Suivi persistant** : les fichiers déjà traités ne sont pas rejoués (fichier `state.json`)
+- **Verrou mono-instance** : impossible de lancer deux instances en parallèle
+- **Détection de fin d'écriture** : attend que le fichier distant soit stable
+- **Reconnexion automatique** avec keepalive SSH
+- **Logs rotatifs** avec mode DEBUG activable
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Service (NSSM)                                             │
+│  - Verrou mono-instance                                     │
+│  - Une connexion SFTP avec keepalive                        │
+│  - Traitement sequentiel                                    │
+│  - State persistant (state.json)                            │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+                       ▼  Pour chaque fichier distant
+┌─────────────────────────────────────────────────────────────┐
+│  1. Attendre stabilite (taille + mtime + confirmations)     │
+│  2. Telecharger  remote  ->  local.downloading -> local     │
+│  3. Imprimer (optionnel, via PDFtoPrinter)                  │
+│  4. Archiver localement                                     │
+│  5. Supprimer le fichier distant                            │
+│  6. Marquer comme traite dans state.json                    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Installation
+
+### Prérequis
+
+- Python 3.9+
+- [PDFtoPrinter](http://www.columbia.edu/~em36/pdftoprinter.html) (si l'impression est activée)
+- [NSSM](https://nssm.cc/) (pour l'installation en service Windows)
+
+### 1. Cloner le projet
+
+```bash
+git clone https://github.com/Seydr/FTP_Watcher.git
+cd FTP_Watcher
+```
+
+### 2. Installer les dépendances
+
+```bash
+pip install -r requirements.txt
+```
+
+### 3. Générer le `known_hosts`
+
+```bash
+ssh-keyscan -t ecdsa sftp.example.com > known_hosts
+```
+
+### 4. Placer PDFtoPrinter (optionnel)
+
+Créer un dossier `PDFtoPrinter/` à la racine du projet et y placer `PDFtoPrinter.exe`.
+
+### 5. Configurer
+
+```bash
+cp config.example.json config.json
+```
+
+Éditer `config.json` avec vos valeurs (identifiants SFTP, chemins locaux, imprimante, etc.).
+
+### 6. Test manuel
+
+```bash
+python sftp_watcher.py config.json
+```
+
+Déposez un fichier correspondant au filtre sur le serveur SFTP distant et vérifiez les logs.
+
+## Configuration
+
+### SFTP
+
+| Clé | Type | Description |
+| :--- | :--- | :--- |
+| `hostname` | string | Serveur SFTP |
+| `port` | int | Port (défaut: 22) |
+| `username` | string | Utilisateur |
+| `password` | string | Mot de passe (si pas de clé privée) |
+| `private_key_path` | string ou null | Chemin vers la clé privée SSH |
+| `known_hosts_file` | string | Fichier known_hosts |
+| `remote_path` | string | Répertoire distant à surveiller |
+| `retries` | int | Nombre de tentatives de connexion |
+
+### Traitement
+
+| Clé | Type | Description |
+| :--- | :--- | :--- |
+| `local_path` | string | Répertoire local de téléchargement |
+| `archive_dir` | string | Répertoire d'archivage après traitement |
+| `extensions_valides` | array | Extensions acceptées (ex: `[".pdf", ".csv"]`) |
+| `supprimer_apres_traitement` | bool | Supprime le fichier distant après succès |
+| `archiver_fichier` | bool | Déplace le fichier local vers `archive_dir` |
+| `imprimer_fichier` | bool | Imprime le fichier via PDFtoPrinter |
+
+### Impression
+
+| Clé | Type | Description |
+| :--- | :--- | :--- |
+| `printer_name` | string | Nom de l'imprimante cible |
+| `pdf_to_printer_path` | string | Chemin complet vers `PDFtoPrinter.exe` |
+
+### Temporisations
+
+| Clé | Type | Description |
+| :--- | :--- | :--- |
+| `check_interval` | number | Intervalle de scan en secondes |
+| `temps_attente` | number | Délai entre 2 vérifications de stabilité |
+| `retries_stabilite` | int | Nombre max de vérifications |
+| `stability_confirmations` | int | Confirmations consécutives requises |
+| `sleep_before_print` | number | Délai avant impression |
+| `sleep_before_move` | number | Délai avant archivage |
+
+### Logs
+
+| Clé | Type | Description |
+| :--- | :--- | :--- |
+| `activer_logs` | bool | Active ou non les logs |
+| `log_file` | string | Chemin du fichier de log |
+| `log_level` | string | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` |
+| `log_backup_count` | int | Nombre de jours d'historique |
+
+### État et verrouillage
+
+| Clé | Type | Description |
+| :--- | :--- | :--- |
+| `lock_file` | string | Fichier de verrou mono-instance |
+| `state_file` | string | Fichier de suivi des fichiers traités |
+| `state_retention_days` | int | Durée de conservation des entrées du state |
+| `purge_state_every_n_cycles` | int | Fréquence de purge du state |
+
+## Déploiement en service Windows
+
+Une fois le test manuel validé, installez le service avec NSSM :
+
+```cmd
+nssm install FTPWatcher "C:\Python311\python.exe" "C:\Path\sftp_watcher.py" "C:\Path\config.json"
+nssm set FTPWatcher AppDirectory "C:\Path"
+nssm set FTPWatcher AppStdout "C:\Path\logs\stdout.log"
+nssm set FTPWatcher AppStderr "C:\Path\logs\stderr.log"
+nssm set FTPWatcher AppRotateFiles 1
+nssm set FTPWatcher AppRotateOnline 1
+nssm set FTPWatcher AppRotateBytes 10485760
+nssm set FTPWatcher AppExit Default Restart
+nssm set FTPWatcher AppRestartDelay 5000
+nssm set FTPWatcher Start SERVICE_AUTO_START
+nssm start FTPWatcher
+```
+
+### Commandes utiles
+
+| Action | Commande |
+| :--- | :--- |
+| Démarrer | `nssm start FTPWatcher` |
+| Arrêter | `nssm stop FTPWatcher` |
+| Redémarrer | `nssm restart FTPWatcher` |
+| Voir le statut | `nssm status FTPWatcher` |
+| Éditer la config | `nssm edit FTPWatcher` |
+| Supprimer | `nssm remove FTPWatcher confirm` |
+
+## Comportement en cas d'erreur
+
+| Situation | Comportement |
+| :--- | :--- |
+| Fichier distant en cours d'écriture | Attend la stabilité (max ~8 s) |
+| Coupure réseau pendant téléchargement | Le `.downloading` est supprimé, retry au prochain cycle |
+| Échec d'impression | Le fichier distant n'est **pas** supprimé → retry |
+| Échec d'archivage | Le fichier distant n'est **pas** supprimé → retry |
+| Coupure SFTP prolongée | Reconnexion auto (3 tentatives × 5 s) |
+| Échec définitif de reconnexion | Arrêt en erreur → NSSM redémarre |
+| Crash après suppression distante | Le fichier est marqué dans `state.json` → pas de retry |
+
+## Dépannage
+
+### Le service ne démarre pas
+
+Vérifier que `config.json` est valide et que le `known_hosts_file` existe. Consulter `logs\stdout.log` et `logs\stderr.log`.
+
+### Les fichiers ne sont pas téléchargés
+
+Vérifier dans les logs :
+- La connexion SFTP est-elle réussie ?
+- Le filtre `extensions_valides` correspond-il bien aux fichiers déposés ?
+- Les fichiers sont-ils en `state.json` (déjà traités) ?
+
+### Un fichier est marqué comme traité mais n'a pas été imprimé
+
+Vérifier que le fichier `state.json` ne contient pas une entrée erronée. Si besoin, éditer le fichier pour retirer l'entrée.
+
+### Activer le mode DEBUG
+
+Dans `config.json` :
+```json
+"log_level": "DEBUG"
+```
+
+Puis redémarrer le service. Attention : le mode DEBUG génère beaucoup de volume.
+
+## Licence
+
+MIT — voir le fichier [LICENSE](LICENSE).
