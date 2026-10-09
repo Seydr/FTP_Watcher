@@ -228,6 +228,16 @@ Dans `config.json` :
 
 Puis redémarrer le service. Attention : le mode DEBUG génère beaucoup de volume.
 
+## PDFtoPrinter
+
+Ce projet inclut une copie de `PDFtoPrinter.exe` dans le dossier `PDFtoPrinter/`.
+
+Cet outil est distribué par **Edward Mendelson** (Columbia University) :
+
+> http://www.columbia.edu/~em36/pdftoprinter.html
+
+Il est utilisé uniquement si `imprimer_fichier` est activé dans `config.json`.
+
 ## Licence
 
 MIT — voir le fichier [LICENSE](LICENSE).
